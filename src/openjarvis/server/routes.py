@@ -451,10 +451,11 @@ async def _handle_agent_stream_real(
                         )
 
                     # Emit tool result as SSE event (informational)
-                    yield (
-                        f"event: tool_result\n"
-                        f"data: {_json.dumps({'tool_name': tool_name, 'output': tool_result_content})}\n\n"
-                    )
+                    tr_data = _json.dumps({
+                        "tool_name": tool_name,
+                        "output": tool_result_content,
+                    })
+                    yield f"event: tool_result\ndata: {tr_data}\n\n"
 
                     # Append tool result to conversation for next turn
                     messages_for_llm.append(Message(

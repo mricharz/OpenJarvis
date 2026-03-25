@@ -15,6 +15,23 @@ from openjarvis.core.types import Message
 
 
 @dataclass(slots=True)
+class StreamChunk:
+    """A single chunk emitted by ``stream_full()``.
+
+    Attributes:
+        content: Visible content token (may be empty).
+        reasoning: Reasoning / thinking token (may be ``None``).
+        finish_reason: Set on the final chunk (e.g. ``"stop"``).
+        usage: Token usage dict, typically on the final chunk.
+    """
+
+    content: str = ""
+    reasoning: Optional[str] = None
+    finish_reason: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = field(default=None)
+
+
+@dataclass(slots=True)
 class ResponseFormat:
     """Structured output configuration for inference engines.
 
@@ -79,5 +96,28 @@ class InferenceEngine(ABC):
     def prepare(self, model: str) -> None:
         """Optional warm-up hook called before the first request."""
 
+    async def stream_full(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield :class:`StreamChunk` objects with content + reasoning.
 
-__all__ = ["InferenceEngine", "ResponseFormat"]
+        Default implementation wraps ``stream()`` so that engines
+        which only implement ``stream()`` still work.
+        """
+        async for token in self.stream(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        ):
+            yield StreamChunk(content=token, reasoning=None)
+
+
+__all__ = ["InferenceEngine", "ResponseFormat", "StreamChunk"]

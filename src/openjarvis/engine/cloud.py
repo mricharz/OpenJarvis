@@ -15,6 +15,7 @@ from openjarvis.engine._base import (
     InferenceEngine,
     messages_to_dicts,
 )
+from openjarvis.engine._stubs import StreamChunk
 
 # Pricing per million tokens (input, output)
 PRICING: Dict[str, tuple[float, float]] = {
@@ -304,6 +305,13 @@ class CloudEngine(InferenceEngine):
             "cost_usd": estimate_cost(model, prompt_tokens, completion_tokens),
             "ttft": elapsed,
         }
+
+        # Extract reasoning content if present (OpenAI o-series)
+        reasoning = getattr(
+            choice.message, "reasoning_content", None
+        )
+        if reasoning:
+            result["reasoning_content"] = reasoning
 
         # Extract tool_calls if present
         if hasattr(choice.message, "tool_calls") and choice.message.tool_calls:
@@ -914,6 +922,257 @@ class CloudEngine(InferenceEngine):
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
                 yield delta.content
+
+    # -- stream_full: provider-specific reasoning extraction ------
+
+    async def stream_full(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield :class:`StreamChunk` with reasoning per provider."""
+        kw = dict(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        )
+        if _is_openrouter_model(model):
+            async for chunk in self._stream_full_openai_sdk(
+                self._openrouter_client,
+                messages,
+                strip_prefix="openrouter/",
+                **kw,
+            ):
+                yield chunk
+        elif _is_minimax_model(model):
+            async for chunk in self._stream_full_openai_sdk(
+                self._minimax_client,
+                messages,
+                clamp_temp=True,
+                **kw,
+            ):
+                yield chunk
+        elif _is_anthropic_model(model):
+            async for chunk in self._stream_full_anthropic(
+                messages, **kw
+            ):
+                yield chunk
+        elif _is_google_model(model):
+            async for chunk in self._stream_full_google(
+                messages, **kw
+            ):
+                yield chunk
+        else:
+            async for chunk in self._stream_full_openai_sdk(
+                self._openai_client,
+                messages,
+                is_openai=True,
+                **kw,
+            ):
+                yield chunk
+
+    async def _stream_full_openai_sdk(
+        self,
+        client: Any,
+        messages: Sequence[Message],
+        *,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        strip_prefix: str = "",
+        clamp_temp: bool = False,
+        is_openai: bool = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream with reasoning from OpenAI-SDK-based clients.
+
+        Handles OpenAI, OpenRouter, and MiniMax via their shared
+        SDK interface. Parses ``delta.reasoning_content`` (OpenAI
+        o-series) and ``delta.reasoning`` (vLLM / OpenRouter).
+        """
+        if client is None:
+            raise EngineConnectionError(
+                "Client not available for streaming"
+            )
+        actual_model = model
+        if strip_prefix and model.startswith(strip_prefix):
+            actual_model = model[len(strip_prefix):]
+        if clamp_temp:
+            temperature = max(min(temperature, 1.0), 0.01)
+        create_kwargs: Dict[str, Any] = {
+            "model": actual_model,
+            "messages": messages_to_dicts(messages),
+            "stream": True,
+        }
+        if is_openai:
+            create_kwargs["max_completion_tokens"] = max_tokens
+            if not _is_openai_reasoning_model(model):
+                create_kwargs["temperature"] = temperature
+        else:
+            create_kwargs["max_tokens"] = max_tokens
+            create_kwargs["temperature"] = temperature
+
+        resp = client.chat.completions.create(**create_kwargs)
+        for chunk in resp:
+            delta = (
+                chunk.choices[0].delta if chunk.choices else None
+            )
+            if delta is None:
+                continue
+            content = delta.content or ""
+            reasoning = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+            )
+            finish = (
+                chunk.choices[0].finish_reason
+                if chunk.choices
+                else None
+            )
+            yield StreamChunk(
+                content=content,
+                reasoning=reasoning or None,
+                finish_reason=finish,
+            )
+
+    async def _stream_full_anthropic(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream with reasoning from Anthropic.
+
+        Maps ``thinking`` content blocks to ``reasoning``.
+        """
+        if self._anthropic_client is None:
+            raise EngineConnectionError(
+                "Anthropic client not available"
+            )
+        system_text = ""
+        chat_msgs: List[Dict[str, Any]] = []
+        for m in messages:
+            if m.role.value == "system":
+                system_text = m.content
+            else:
+                chat_msgs.append(
+                    {"role": m.role.value, "content": m.content}
+                )
+        create_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": chat_msgs,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if system_text:
+            create_kwargs["system"] = system_text
+        with self._anthropic_client.messages.stream(
+            **create_kwargs
+        ) as stream:
+            for event in stream:
+                ev_type = getattr(event, "type", "")
+                if ev_type == "content_block_delta":
+                    delta = getattr(event, "delta", None)
+                    if delta is None:
+                        continue
+                    delta_type = getattr(delta, "type", "")
+                    if delta_type == "thinking_delta":
+                        yield StreamChunk(
+                            content="",
+                            reasoning=getattr(
+                                delta, "thinking", ""
+                            ),
+                        )
+                    elif delta_type == "text_delta":
+                        yield StreamChunk(
+                            content=getattr(
+                                delta, "text", ""
+                            ),
+                            reasoning=None,
+                        )
+                elif ev_type == "message_stop":
+                    yield StreamChunk(
+                        content="",
+                        reasoning=None,
+                        finish_reason="stop",
+                    )
+
+    async def _stream_full_google(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream with reasoning from Google Gemini.
+
+        Maps ``thought`` parts to ``reasoning``.
+        """
+        if self._google_client is None:
+            raise EngineConnectionError(
+                "Google client not available"
+            )
+        system_text = ""
+        contents: List[Dict[str, Any]] = []
+        for m in messages:
+            if m.role.value == "system":
+                system_text = m.content
+            elif m.role.value == "assistant":
+                contents.append(
+                    {"role": "model",
+                     "parts": [{"text": m.content}]}
+                )
+            else:
+                contents.append(
+                    {"role": "user",
+                     "parts": [{"text": m.content}]}
+                )
+
+        from google.genai import types as genai_types
+
+        config = genai_types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+        if system_text:
+            config.system_instruction = system_text
+
+        for chunk in (
+            self._google_client.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        ):
+            candidates = getattr(chunk, "candidates", None)
+            if not candidates:
+                continue
+            parts = getattr(
+                candidates[0].content, "parts", []
+            )
+            for part in parts:
+                thought = getattr(part, "thought", False)
+                text = getattr(part, "text", "") or ""
+                if thought:
+                    yield StreamChunk(
+                        content="",
+                        reasoning=text,
+                    )
+                elif text:
+                    yield StreamChunk(
+                        content=text,
+                        reasoning=None,
+                    )
 
     def list_models(self) -> List[str]:
         models: List[str] = []

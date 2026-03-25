@@ -624,6 +624,66 @@ These events enable the telemetry and trace systems to record detailed interacti
 
 ---
 
+## Reasoning / Thinking
+
+Many modern LLMs support chain-of-thought reasoning that is returned separately from the visible response. OpenJarvis provides provider-agnostic reasoning support through the `StreamChunk` dataclass and `stream_full()` method.
+
+### How it works
+
+The `stream_full()` method on every `InferenceEngine` yields `StreamChunk` objects that carry both `content` (visible answer) and `reasoning` (thinking steps) fields:
+
+```python
+from openjarvis.engine._stubs import StreamChunk
+
+async for chunk in engine.stream_full(messages, model=model):
+    if chunk.reasoning:
+        print(f"[thinking] {chunk.reasoning}", end="")
+    if chunk.content:
+        print(chunk.content, end="")
+```
+
+### Provider support
+
+| Provider | Reasoning source | Notes |
+|----------|-----------------|-------|
+| **OpenAI** (o-series, GPT-5-mini) | `delta.reasoning_content` | Native reasoning field in API |
+| **Anthropic** (Claude extended thinking) | `thinking_delta` event | Mapped from content_block_delta |
+| **Google** (Gemini thinking) | `part.thought` | Thought parts in streamed candidates |
+| **OpenRouter / vLLM** | `delta.reasoning` | Same SSE format as OpenAI-compat |
+| **Ollama / LlamaCpp** | `<think>` tags in content | Filtered by `ThinkTagFilter` |
+| **LiteLLM** | Depends on upstream provider | Uses default `stream_full()` wrapper |
+
+### ThinkTagFilter
+
+For engines that embed reasoning in `<think>...</think>` tags within the content stream (Ollama, LlamaCpp, etc.), the `ThinkTagFilter` provides a streaming state machine that separates reasoning from visible content:
+
+```python
+from openjarvis.server.think_filter import ThinkTagFilter
+
+f = ThinkTagFilter()
+visible, reasoning = f.feed("<think>Let me think...</think>The answer is 42.")
+# visible = "The answer is 42."
+# reasoning = "Let me think..."
+```
+
+The filter handles:
+- Standard `<think>...</think>` blocks
+- Bare `</think>` without opening tag (distilled models)
+- Tags split across multiple streaming chunks
+
+### SSE format for downstream consumers
+
+When reasoning is present in the SSE stream, it appears as:
+
+```
+data: {"choices": [{"delta": {"content": "", "reasoning_content": "step 1"}}]}
+data: {"choices": [{"delta": {"content": "The answer is 42."}}]}
+data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+data: [DONE]
+```
+
+---
+
 ## Managed Agent Streaming
 
 The Managed Agent API (`/v1/managed-agents/{id}/messages`) supports real-time SSE streaming. Send a message with `stream: true` to receive the agent's response as a Server-Sent Events stream instead of the default asynchronous queue mode.

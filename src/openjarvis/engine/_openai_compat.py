@@ -16,6 +16,7 @@ from openjarvis.engine._base import (
     estimate_prompt_tokens,
     messages_to_dicts,
 )
+from openjarvis.engine._stubs import StreamChunk
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,14 @@ class _OpenAICompatibleEngine(InferenceEngine):
             "model": data.get("model", model),
             "finish_reason": choice.get("finish_reason", "stop"),
         }
+        # Extract reasoning content if present (OpenAI o-series,
+        # DeepSeek, vLLM reasoning models)
+        reasoning = (
+            choice["message"].get("reasoning_content")
+            or choice["message"].get("reasoning")
+        )
+        if reasoning:
+            result["reasoning_content"] = reasoning
         # Extract tool calls if present
         raw_tool_calls = choice["message"].get("tool_calls", [])
         if raw_tool_calls:
@@ -143,6 +152,70 @@ class _OpenAICompatibleEngine(InferenceEngine):
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
             raise EngineConnectionError(
                 f"{self.engine_id} engine not reachable at {self._host}"
+            ) from exc
+
+    async def stream_full(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield :class:`StreamChunk` with content and reasoning.
+
+        Parses ``delta.reasoning`` and ``delta.reasoning_content``
+        from the SSE stream (used by vLLM, DeepSeek, OpenAI o-series).
+        """
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages_to_dicts(messages),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+            **kwargs,
+        }
+        try:
+            url = f"{self._api_prefix}/chat/completions"
+            with self._client.stream(
+                "POST", url, json=payload
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices", [{}])
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content") or ""
+                    reasoning = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                    )
+                    finish = choice.get("finish_reason")
+                    usage = chunk.get("usage")
+                    yield StreamChunk(
+                        content=content,
+                        reasoning=reasoning or None,
+                        finish_reason=finish,
+                        usage=usage,
+                    )
+        except (
+            httpx.ConnectError, httpx.TimeoutException,
+        ) as exc:
+            raise EngineConnectionError(
+                f"{self.engine_id} engine not reachable "
+                f"at {self._host}"
             ) from exc
 
     def list_models(self) -> List[str]:

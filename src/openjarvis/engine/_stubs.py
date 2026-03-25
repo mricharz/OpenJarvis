@@ -21,12 +21,14 @@ class StreamChunk:
     Attributes:
         content: Visible content token (may be empty).
         reasoning: Reasoning / thinking token (may be ``None``).
+        tool_calls: Incremental tool call fragments from the LLM.
         finish_reason: Set on the final chunk (e.g. ``"stop"``).
         usage: Token usage dict, typically on the final chunk.
     """
 
     content: str = ""
     reasoning: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = field(default=None)
     finish_reason: Optional[str] = None
     usage: Optional[Dict[str, Any]] = field(default=None)
 

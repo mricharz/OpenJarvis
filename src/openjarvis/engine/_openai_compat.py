@@ -202,14 +202,17 @@ class _OpenAICompatibleEngine(InferenceEngine):
                         delta.get("reasoning")
                         or delta.get("reasoning_content")
                     )
+                    tool_calls = delta.get("tool_calls")
                     finish = choice.get("finish_reason")
                     usage = chunk.get("usage")
-                    yield StreamChunk(
-                        content=content,
-                        reasoning=reasoning or None,
-                        finish_reason=finish,
-                        usage=usage,
-                    )
+                    if content or reasoning or tool_calls or finish:
+                        yield StreamChunk(
+                            content=content,
+                            reasoning=reasoning or None,
+                            tool_calls=tool_calls,
+                            finish_reason=finish,
+                            usage=usage,
+                        )
         except (
             httpx.ConnectError, httpx.TimeoutException,
         ) as exc:

@@ -128,13 +128,13 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             )
 
     if request_body.stream:
-        bus = getattr(request.app.state, "bus", None)
-        # Use the agent stream bridge only when tools are present (the
-        # bridge runs agent.run() synchronously and word-splits the result,
-        # so it can't stream tokens in real-time).  For plain chat, stream
-        # directly from the engine for true token-by-token output.
-        if agent is not None and bus is not None and request_body.tools:
-            return await _handle_agent_stream(agent, bus, model, request_body)
+        # Prefer real agent streaming (PromptBuilder + tools + multi-turn)
+        # whenever an agent is loaded.  Falls back to plain engine streaming
+        # when no agent is configured.
+        if agent is not None:
+            return await _handle_agent_stream_real(
+                agent, engine, model, request_body,
+            )
         return await _handle_stream(engine, model, request_body, complexity_info)
 
     # Non-streaming: use agent if available, otherwise direct engine call
@@ -255,6 +255,266 @@ async def _handle_agent_stream(agent, bus, model, req):
     from openjarvis.server.stream_bridge import create_agent_stream
 
     return await create_agent_stream(agent, bus, model, req)
+
+
+async def _handle_agent_stream_real(
+    agent,
+    engine,
+    model: str,
+    req: ChatCompletionRequest,
+) -> StreamingResponse:
+    """Stream agent response with real token-by-token output via SSE.
+
+    Uses ``engine.stream_full()`` for true streaming while applying the
+    agent's PromptBuilder (SOUL.md, USER.md, etc.) and executing any
+    tool calls the model emits in a multi-turn loop.
+    """
+    import json as _json
+
+    from openjarvis.core.types import Message, Role
+    from openjarvis.core.types import ToolCall as MsgToolCall
+
+    logger = logging.getLogger("openjarvis.server")
+
+    # -- Build the system prompt via agent's PromptBuilder (if available) --
+    system_prompt: str | None = None
+    pb = getattr(agent, "_prompt_builder", None)
+    if pb is not None:
+        try:
+            system_prompt = pb.build()
+        except Exception:
+            logger.debug("PromptBuilder.build() failed, falling back", exc_info=True)
+
+    # Fall back to the system message from the request (if any)
+    if not system_prompt:
+        for m in req.messages:
+            if m.role == "system" and m.content:
+                system_prompt = m.content
+                break
+
+    # -- Assemble LLM messages: system + request messages (excluding
+    #    the original system message to avoid duplication) --
+    llm_messages: list[Message] = []
+    if system_prompt:
+        llm_messages.append(Message(role=Role.SYSTEM, content=system_prompt))
+    for m in req.messages:
+        if m.role == "system":
+            # Already handled above via PromptBuilder or fallback
+            continue
+        role = Role(m.role) if m.role in {r.value for r in Role} else Role.USER
+        llm_messages.append(Message(
+            role=role,
+            content=m.content or "",
+            name=m.name,
+            tool_call_id=m.tool_call_id,
+        ))
+
+    # -- Collect tool definitions from the agent --
+    openai_tools: list[dict] = []
+    executor = getattr(agent, "_executor", None)
+    if executor is not None:
+        try:
+            openai_tools = executor.get_openai_tools()
+        except Exception:
+            logger.debug("Failed to get agent tools", exc_info=True)
+
+    # Also include tools from the request (client-supplied)
+    if req.tools:
+        openai_tools = openai_tools + list(req.tools)
+
+    stream_kwargs: dict = {}
+    if openai_tools:
+        stream_kwargs["tools"] = openai_tools
+
+    temperature = req.temperature
+    max_tokens = req.max_tokens
+    max_turns = getattr(agent, "_max_turns", 10)
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+    async def generate():
+        """Async generator yielding SSE chunks with real token streaming."""
+        messages_for_llm = list(llm_messages)
+        turns = 0
+
+        while turns < max_turns:
+            turns += 1
+            turn_content = ""
+            tool_call_fragments: dict[int, dict] = {}
+            current_finish_reason = None
+
+            try:
+                async for chunk in engine.stream_full(
+                    messages_for_llm,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **stream_kwargs,
+                ):
+                    # Stream content tokens to the client immediately
+                    if chunk.content:
+                        turn_content += chunk.content
+                        chunk_data = ChatCompletionChunk(
+                            id=chunk_id,
+                            model=model,
+                            choices=[StreamChoice(
+                                delta=DeltaMessage(content=chunk.content),
+                            )],
+                        )
+                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                    # Accumulate tool_call fragments
+                    if chunk.tool_calls:
+                        _merge_tool_call_fragments(
+                            tool_call_fragments, chunk.tool_calls,
+                        )
+
+                    if chunk.finish_reason:
+                        current_finish_reason = chunk.finish_reason
+
+            except Exception as exc:
+                logger.error("Agent stream error: %s", exc, exc_info=True)
+                error_chunk = ChatCompletionChunk(
+                    id=chunk_id,
+                    model=model,
+                    choices=[StreamChoice(
+                        delta=DeltaMessage(
+                            content=f"\n\nError during generation: {exc}",
+                        ),
+                        finish_reason="stop",
+                    )],
+                )
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            # -- Handle tool calls: execute and loop for the next turn --
+            if tool_call_fragments and current_finish_reason == "tool_calls":
+                sorted_tcs = [
+                    tool_call_fragments[i]
+                    for i in sorted(tool_call_fragments.keys())
+                ]
+
+                # Emit tool_calls metadata as SSE event (informational)
+                tool_meta = [
+                    {
+                        "tool_name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    }
+                    for tc in sorted_tcs
+                ]
+                yield (
+                    f"event: tool_calls\n"
+                    f"data: {_json.dumps({'calls': tool_meta})}\n\n"
+                )
+
+                # Append assistant message with tool_calls to the conversation
+                assistant_msg = Message(
+                    role=Role.ASSISTANT,
+                    content=turn_content or None,
+                    tool_calls=[
+                        MsgToolCall(
+                            id=tc["id"],
+                            name=tc["function"]["name"],
+                            arguments=tc["function"]["arguments"],
+                        )
+                        for tc in sorted_tcs
+                    ],
+                )
+                messages_for_llm.append(assistant_msg)
+
+                # Execute each tool call and feed results back
+                for tc in sorted_tcs:
+                    tool_name = tc["function"]["name"]
+                    tool_args = tc["function"]["arguments"]
+                    tool_result_content = f"Tool '{tool_name}' not available"
+
+                    try:
+                        if executor is not None:
+                            result = executor.execute(MsgToolCall(
+                                id=tc["id"],
+                                name=tool_name,
+                                arguments=tool_args,
+                            ))
+                            tool_result_content = result.content
+                        else:
+                            logger.warning(
+                                "No executor available for tool '%s'", tool_name,
+                            )
+                    except Exception as tool_exc:
+                        logger.error(
+                            "Tool execution error for %s: %s",
+                            tool_name, tool_exc, exc_info=True,
+                        )
+                        tool_result_content = (
+                            f"Error executing {tool_name}: {tool_exc}"
+                        )
+
+                    # Emit tool result as SSE event (informational)
+                    yield (
+                        f"event: tool_result\n"
+                        f"data: {_json.dumps({'tool_name': tool_name, 'output': tool_result_content})}\n\n"
+                    )
+
+                    # Append tool result to conversation for next turn
+                    messages_for_llm.append(Message(
+                        role=Role.TOOL,
+                        content=tool_result_content,
+                        tool_call_id=tc["id"],
+                        name=tool_name,
+                    ))
+
+                # Continue to next turn (loop back to stream_full)
+                continue
+
+            # No tool calls — final response turn
+            break
+
+        # Send finish chunk
+        finish_chunk = ChatCompletionChunk(
+            id=chunk_id,
+            model=model,
+            choices=[StreamChoice(
+                delta=DeltaMessage(),
+                finish_reason="stop",
+            )],
+        )
+        yield f"data: {finish_chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+def _merge_tool_call_fragments(
+    accumulated: dict[int, dict],
+    fragments: list[dict],
+) -> None:
+    """Merge incremental tool_call delta fragments into accumulated state.
+
+    OpenAI-compatible APIs send tool_calls as incremental fragments keyed
+    by ``index``. Each fragment may contain partial ``function.name`` and/or
+    ``function.arguments`` strings that must be concatenated.
+    """
+    for frag in fragments:
+        idx = frag.get("index", 0)
+        if idx not in accumulated:
+            accumulated[idx] = {
+                "id": frag.get("id", ""),
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            }
+        entry = accumulated[idx]
+        if frag.get("id"):
+            entry["id"] = frag["id"]
+        fn = frag.get("function", {})
+        if fn.get("name"):
+            entry["function"]["name"] += fn["name"]
+        if fn.get("arguments"):
+            entry["function"]["arguments"] += fn["arguments"]
 
 
 async def _handle_stream(

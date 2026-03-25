@@ -133,7 +133,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         # when no agent is configured.
         if agent is not None:
             return await _handle_agent_stream_real(
-                agent, engine, model, request_body,
+                agent, engine, model, request_body, request,
             )
         return await _handle_stream(engine, model, request_body, complexity_info)
 
@@ -262,6 +262,7 @@ async def _handle_agent_stream_real(
     engine,
     model: str,
     req: ChatCompletionRequest,
+    request: Request = None,
 ) -> StreamingResponse:
     """Stream agent response with real token-by-token output via SSE.
 
@@ -321,6 +322,21 @@ async def _handle_agent_stream_real(
     # Also include tools from the request (client-supplied)
     if req.tools:
         openai_tools = openai_tools + list(req.tools)
+
+    # Discover MCP tools and merge
+    mcp_adapters: dict = {}
+    if request is not None:
+        try:
+            from openjarvis.server.agent_manager_routes import _get_mcp_tools
+            mcp_openai_tools, mcp_adapters = _get_mcp_tools(request.app.state)
+            if mcp_openai_tools:
+                openai_tools = openai_tools + mcp_openai_tools
+                logger.info(
+                    "Added %d MCP tools to chat/completions stream",
+                    len(mcp_openai_tools),
+                )
+        except Exception:
+            logger.debug("Failed to get MCP tools for chat/completions", exc_info=True)
 
     stream_kwargs: dict = {}
     if openai_tools:
@@ -439,7 +455,16 @@ async def _handle_agent_stream_real(
                     tool_result_content = f"Tool '{tool_name}' not available"
 
                     try:
-                        if executor is not None:
+                        # Try MCP adapter first (external tools)
+                        mcp_adapter = mcp_adapters.get(tool_name)
+                        if mcp_adapter is not None:
+                            try:
+                                parsed_args = _json.loads(tool_args) if tool_args else {}
+                            except (_json.JSONDecodeError, TypeError):
+                                parsed_args = {}
+                            result = mcp_adapter.execute(**parsed_args)
+                            tool_result_content = result.content
+                        elif executor is not None:
                             result = executor.execute(MsgToolCall(
                                 id=tc["id"],
                                 name=tool_name,

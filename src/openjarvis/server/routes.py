@@ -351,17 +351,26 @@ async def _handle_agent_stream_real(
                     max_tokens=max_tokens,
                     **stream_kwargs,
                 ):
-                    # Stream content tokens to the client immediately
+                    # Stream content tokens to the client.
+                    # Note: thinking/reasoning tokens arrive in
+                    # delta.reasoning (not delta.content) and are
+                    # already filtered out by stream_full().
                     if chunk.content:
                         turn_content += chunk.content
                         chunk_data = ChatCompletionChunk(
                             id=chunk_id,
                             model=model,
                             choices=[StreamChoice(
-                                delta=DeltaMessage(content=chunk.content),
+                                delta=DeltaMessage(
+                                    content=chunk.content,
+                                ),
                             )],
                         )
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        yield (
+                            f"data: "
+                            f"{chunk_data.model_dump_json()}"
+                            f"\n\n"
+                        )
 
                     # Accumulate tool_call fragments
                     if chunk.tool_calls:

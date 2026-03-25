@@ -16,17 +16,19 @@ from openjarvis.core.types import Message
 
 @dataclass(slots=True)
 class StreamChunk:
-    """A single chunk from a streaming LLM response.
+    """A single chunk emitted by ``stream_full()``.
 
-    Used by ``stream_full()`` to yield rich streaming data including
-    tool_calls fragments and finish_reason, unlike ``stream()`` which
-    only yields plain content strings.
+    Attributes:
+        content: Visible content token (may be empty).
+        reasoning: Reasoning / thinking token (may be ``None``).
+        finish_reason: Set on the final chunk (e.g. ``"stop"``).
+        usage: Token usage dict, typically on the final chunk.
     """
 
-    content: Optional[str] = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
+    content: str = ""
+    reasoning: Optional[str] = None
     finish_reason: Optional[str] = None
-    usage: Optional[Dict[str, Any]] = None
+    usage: Optional[Dict[str, Any]] = field(default=None)
 
 
 @dataclass(slots=True)
@@ -80,27 +82,6 @@ class InferenceEngine(ABC):
         # NOTE: must contain a yield to satisfy the type checker
         yield ""  # pragma: no cover
 
-    async def stream_full(
-        self,
-        messages: Sequence[Message],
-        *,
-        model: str,
-        temperature: float = 0.7,
-        max_tokens: int = 1024,
-        **kwargs: Any,
-    ) -> AsyncIterator["StreamChunk"]:
-        """Yield full StreamChunks including tool_calls and finish_reason.
-
-        Default implementation wraps ``stream()`` for backward compatibility.
-        Engines with native tool-call streaming should override this.
-        """
-        async for token in self.stream(
-            messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, **kwargs,
-        ):
-            yield StreamChunk(content=token)
-        yield StreamChunk(finish_reason="stop")
-
     @abstractmethod
     def list_models(self) -> List[str]:
         """Return identifiers of models available on this engine."""
@@ -114,6 +95,29 @@ class InferenceEngine(ABC):
 
     def prepare(self, model: str) -> None:
         """Optional warm-up hook called before the first request."""
+
+    async def stream_full(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield :class:`StreamChunk` objects with content + reasoning.
+
+        Default implementation wraps ``stream()`` so that engines
+        which only implement ``stream()`` still work.
+        """
+        async for token in self.stream(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        ):
+            yield StreamChunk(content=token, reasoning=None)
 
 
 __all__ = ["InferenceEngine", "ResponseFormat", "StreamChunk"]

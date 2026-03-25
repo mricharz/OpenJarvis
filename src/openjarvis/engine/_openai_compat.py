@@ -13,6 +13,7 @@ from openjarvis.core.types import Message
 from openjarvis.engine._base import (
     EngineConnectionError,
     InferenceEngine,
+    estimate_prompt_tokens,
     messages_to_dicts,
 )
 from openjarvis.engine._stubs import StreamChunk
@@ -50,9 +51,6 @@ class _OpenAICompatibleEngine(InferenceEngine):
             "stream": False,
             **kwargs,
         }
-        # Default to tool_choice=auto when tools are provided
-        if "tools" in payload and "tool_choice" not in payload:
-            payload["tool_choice"] = "auto"
         try:
             url = f"{self._api_prefix}/chat/completions"
             resp = self._client.post(url, json=payload)
@@ -76,16 +74,33 @@ class _OpenAICompatibleEngine(InferenceEngine):
             }
         choice = choices[0]
         usage = data.get("usage", {})
+        # Ensure prompt_tokens reflects the full prompt size (including
+        # system prompt and all conversation history).
+        # OpenAI-compat APIs (vLLM, SGLang) report full counts — KV
+        # caching is transparent, so evaluated == full.
+        reported_prompt = usage.get("prompt_tokens", 0)
+        estimated_prompt = estimate_prompt_tokens(messages)
+        prompt_tokens = max(reported_prompt, estimated_prompt)
+        completion_tokens = usage.get("completion_tokens", 0)
         result: Dict[str, Any] = {
             "content": choice["message"].get("content") or "",
             "usage": {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
+                "prompt_tokens": prompt_tokens,
+                "prompt_tokens_evaluated": reported_prompt or prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
             "model": data.get("model", model),
             "finish_reason": choice.get("finish_reason", "stop"),
         }
+        # Extract reasoning content if present (OpenAI o-series,
+        # DeepSeek, vLLM reasoning models)
+        reasoning = (
+            choice["message"].get("reasoning_content")
+            or choice["message"].get("reasoning")
+        )
+        if reasoning:
+            result["reasoning_content"] = reasoning
         # Extract tool calls if present
         raw_tool_calls = choice["message"].get("tool_calls", [])
         if raw_tool_calls:
@@ -116,9 +131,6 @@ class _OpenAICompatibleEngine(InferenceEngine):
             "stream": True,
             **kwargs,
         }
-        # Default to tool_choice=auto when tools are provided
-        if "tools" in payload and "tool_choice" not in payload:
-            payload["tool_choice"] = "auto"
         try:
             url = f"{self._api_prefix}/chat/completions"
             with self._client.stream("POST", url, json=payload) as resp:
@@ -150,27 +162,25 @@ class _OpenAICompatibleEngine(InferenceEngine):
         temperature: float = 0.7,
         max_tokens: int = 1024,
         **kwargs: Any,
-    ) -> AsyncIterator["StreamChunk"]:
-        """Yield StreamChunks with content, tool_calls, and finish_reason.
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield :class:`StreamChunk` with content and reasoning.
 
-        Parses the OpenAI SSE stream natively, providing richer data than
-        the plain-string ``stream()`` method.
+        Parses ``delta.reasoning`` and ``delta.reasoning_content``
+        from the SSE stream (used by vLLM, DeepSeek, OpenAI o-series).
         """
-        msg_dicts = messages_to_dicts(messages)
         payload: Dict[str, Any] = {
             "model": model,
-            "messages": msg_dicts,
+            "messages": messages_to_dicts(messages),
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
             **kwargs,
         }
-        # Default to tool_choice=auto when tools are provided
-        if "tools" in payload and "tool_choice" not in payload:
-            payload["tool_choice"] = "auto"
         try:
             url = f"{self._api_prefix}/chat/completions"
-            with self._client.stream("POST", url, json=payload) as resp:
+            with self._client.stream(
+                "POST", url, json=payload
+            ) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     if not line.startswith("data:"):
@@ -182,23 +192,30 @@ class _OpenAICompatibleEngine(InferenceEngine):
                         chunk = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
-                    choice = chunk.get("choices", [{}])[0]
+                    choices = chunk.get("choices", [{}])
+                    if not choices:
+                        continue
+                    choice = choices[0]
                     delta = choice.get("delta", {})
+                    content = delta.get("content") or ""
+                    reasoning = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                    )
                     finish = choice.get("finish_reason")
-                    content = delta.get("content")
-                    tool_calls = delta.get("tool_calls")
                     usage = chunk.get("usage")
-
-                    if content or tool_calls or finish or usage:
-                        yield StreamChunk(
-                            content=content,
-                            tool_calls=tool_calls,
-                            finish_reason=finish,
-                            usage=usage,
-                        )
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                    yield StreamChunk(
+                        content=content,
+                        reasoning=reasoning or None,
+                        finish_reason=finish,
+                        usage=usage,
+                    )
+        except (
+            httpx.ConnectError, httpx.TimeoutException,
+        ) as exc:
             raise EngineConnectionError(
-                f"{self.engine_id} engine not reachable at {self._host}"
+                f"{self.engine_id} engine not reachable "
+                f"at {self._host}"
             ) from exc
 
     def list_models(self) -> List[str]:

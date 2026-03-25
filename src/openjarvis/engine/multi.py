@@ -6,7 +6,6 @@ import logging
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, Dict, List
 
-from openjarvis.core.types import Message
 from openjarvis.engine._base import InferenceEngine
 from openjarvis.engine._stubs import StreamChunk
 
@@ -67,7 +66,7 @@ class MultiEngine(InferenceEngine):
 
     def generate(
         self,
-        messages: Sequence[Message],
+        messages: Sequence[Any],
         *,
         model: str,
         temperature: float = 0.7,
@@ -81,7 +80,7 @@ class MultiEngine(InferenceEngine):
 
     async def stream(
         self,
-        messages: Sequence[Message],
+        messages: Sequence[Any],
         *,
         model: str,
         temperature: float = 0.7,
@@ -96,14 +95,18 @@ class MultiEngine(InferenceEngine):
 
     async def stream_full(
         self,
-        messages: Sequence[Message],
+        messages: Sequence[Any],
         *,
         model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
         **kwargs: Any,
-    ) -> AsyncIterator["StreamChunk"]:
-        """Delegate stream_full() to the engine that owns the model."""
-        engine = self._engine_for(model)
-        async for chunk in engine.stream_full(messages, model=model, **kwargs):
+    ) -> AsyncIterator[StreamChunk]:
+        """Delegate ``stream_full()`` to the target engine."""
+        async for chunk in self._engine_for(model).stream_full(
+            messages, model=model, temperature=temperature,
+            max_tokens=max_tokens, **kwargs,
+        ):
             yield chunk
 
     def list_models(self) -> List[str]:
